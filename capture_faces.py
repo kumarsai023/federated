@@ -1,164 +1,218 @@
 import cv2
 import os
 import numpy as np
-from tqdm import tqdm
+from PIL import Image
+import time
 
 class FaceCapture:
     def __init__(self):
         self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        self.required_images = 250
-        # Increased minimum face size
-        self.min_face_width = 200
-        self.min_face_height = 200
-        # Adjusted quality thresholds
-        self.blur_threshold = 80  # Reduced blur threshold
-        self.brightness_threshold = 30  # Reduced brightness threshold
+        self.images_per_angle = 25
+        self.frame_skip = 10
+        self.min_face_size = (150, 150)
         
-    def create_directory(self, student_id):
-        """Create directory for storing student images"""
-        self.image_dir = f'dataset/student_{student_id}'
-        if not os.path.exists(self.image_dir):
-            os.makedirs(self.image_dir)
-        return self.image_dir
+        # Sequential angle states
+        self.angles = [
+            {
+                'name': 'Front Face',
+                'count': 0,
+                'instructions': ['Look straight at camera', 'Maintain neutral expression']
+            },
+            {
+                'name': 'Left Side',
+                'count': 0,
+                'instructions': ['Turn head slightly left', 'Keep eyes level']
+            },
+            {
+                'name': 'Right Side',
+                'count': 0,
+                'instructions': ['Turn head slightly right', 'Keep eyes level']
+            },
+            {
+                'name': 'Up Angle',
+                'count': 0,
+                'instructions': ['Tilt head slightly up', 'Keep eyes on camera']
+            },
+            {
+                'name': 'Down Angle',
+                'count': 0,
+                'instructions': ['Tilt head slightly down', 'Keep eyes on camera']
+            },
+            {
+                'name': 'Expressions',
+                'count': 0,
+                'instructions': ['Show slight smile', 'Blink normally']
+            }
+        ]
+        self.current_angle_index = 0
+        self.capturing = False
+        self.waiting_for_enter = True
 
-    def check_face_quality(self, face_img):
-        """Check if face image meets quality standards"""
-        # Check face size
-        height, width = face_img.shape[:2]
-        if width < self.min_face_width or height < self.min_face_height:
-            return False, "Move closer"
+    def verify_quality(self, face_img):
+        """Verify face image quality"""
+        if face_img.shape[0] < self.min_face_size[0] or face_img.shape[1] < self.min_face_size[1]:
+            return False
+            
+        brightness = np.mean(face_img)
+        if brightness < 40 or brightness > 250:
+            return False
+            
+        contrast = np.std(face_img)
+        if contrast < 20:
+            return False
+            
+        laplacian = cv2.Laplacian(cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var()
+        if laplacian < 100:
+            return False
+            
+        return True
 
-        # Check for blur
-        gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
-        blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
-        if blur_score < self.blur_threshold:
-            return False, "Hold still"
-
-        # Check brightness
-        brightness = np.mean(gray)
-        if brightness < self.brightness_threshold:
-            return False, "Need more light"
-
-        return True, "Good"
-
-    def preprocess_face(self, face_img):
-        """Preprocess the facial image"""
-        # Simple resize to 224x224
-        resized = cv2.resize(face_img, (224, 224))
-        # Convert to RGB
-        final_img = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        return final_img
+    def draw_interface(self, frame, faces):
+        """Draw interface elements on frame"""
+        height, width = frame.shape[:2]
+        
+        # Draw guide box
+        guide_size = (400, 400)
+        x = (width - guide_size[0]) // 2
+        y = (height - guide_size[1]) // 2
+        cv2.rectangle(frame, (x, y), (x + guide_size[0], y + guide_size[1]), (0, 255, 0), 2)
+        
+        # Draw face rectangles
+        for (x, y, w, h) in faces:
+            cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
+        
+        # Draw instructions
+        y_offset = 30
+        if not self.capturing:
+            instructions = [
+                "Press 'S' to start capture process",
+                "Press 'Q' to quit"
+            ]
+        else:
+            current_angle = self.angles[self.current_angle_index]
+            if self.waiting_for_enter:
+                instructions = [
+                    f"Prepare for: {current_angle['name']}",
+                    *current_angle['instructions'],
+                    "Press ENTER when ready"
+                ]
+            else:
+                instructions = [
+                    f"Capturing: {current_angle['name']}",
+                    f"Progress: {current_angle['count']}/{self.images_per_angle}",
+                    *current_angle['instructions']
+                ]
+        
+        for i, text in enumerate(instructions):
+            cv2.putText(frame, text, (10, y_offset + i * 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        # Draw overall progress
+        total_images = sum(angle['count'] for angle in self.angles)
+        total_required = self.images_per_angle * len(self.angles)
+        progress = f"Total Progress: {total_images}/{total_required}"
+        cv2.putText(frame, progress, (10, height - 20),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
     def capture_faces(self, student_id):
-        """Capture and save facial images"""
-        self.create_directory(student_id)
+        """Main capture function"""
+        print("\nStarting face capture for Student", student_id)
+        
         cap = cv2.VideoCapture(0)
-        
-        # Set camera properties for better quality
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        
-        count = 0
-        pbar = tqdm(total=self.required_images, desc='Capturing Faces')
-        
         frame_count = 0
-        frames_between_captures = 8
         
-        while count < self.required_images:
+        # Create directory for student
+        save_dir = os.path.join('dataset', f'student_{student_id}')
+        os.makedirs(save_dir, exist_ok=True)
+        
+        while True:
             ret, frame = cap.read()
             if not ret:
-                print("Failed to grab frame")
                 break
-            
+                
             frame_count += 1
-            
-            # Show original frame with guidelines
-            display_frame = frame.copy()
-            height, width = frame.shape[:2]
-            center_x, center_y = width // 2, height // 2
-            
-            # Draw guide square (larger than before)
-            square_size = 300  # Increased size
-            cv2.rectangle(display_frame, 
-                         (center_x - square_size//2, center_y - square_size//2),
-                         (center_x + square_size//2, center_y + square_size//2),
-                         (0, 255, 0), 2)
-            
-            if frame_count % frames_between_captures != 0:
-                cv2.imshow('Face Capture - Align face within square', display_frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
+            if frame_count % self.frame_skip != 0:
                 continue
                 
+            # Detect faces
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = self.face_cascade.detectMultiScale(
                 gray,
                 scaleFactor=1.1,
-                minNeighbors=4,  # Reduced for better detection
-                minSize=(self.min_face_width, self.min_face_height)
+                minNeighbors=5,
+                minSize=self.min_face_size
             )
             
-            for (x, y, w, h) in faces:
-                face_img = frame[y:y+h, x:x+w]
-                quality_ok, message = self.check_face_quality(face_img)
-                
-                if quality_ok:
-                    cv2.rectangle(display_frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                    cv2.putText(display_frame, message, (x, y-10), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+            # Draw interface
+            self.draw_interface(frame, faces)
+            
+            # Handle face capture
+            if self.capturing and not self.waiting_for_enter and len(faces) > 0:
+                current_angle = self.angles[self.current_angle_index]
+                if current_angle['count'] < self.images_per_angle:
+                    x, y, w, h = faces[0]
+                    face_img = frame[y:y+h, x:x+w]
                     
-                    processed_face = self.preprocess_face(face_img)
-                    image_path = os.path.join(self.image_dir, f'face_{count}.jpg')
-                    cv2.imwrite(image_path, cv2.cvtColor(processed_face, cv2.COLOR_RGB2BGR))
-                    
-                    count += 1
-                    pbar.update(1)
+                    if self.verify_quality(face_img):
+                        img_name = os.path.join(save_dir, 
+                            f'face_{current_angle["name"]}_{current_angle["count"]}.jpg')
+                        cv2.imwrite(img_name, face_img)
+                        current_angle['count'] += 1
+                        time.sleep(0.2)  # Add delay between captures
                 else:
-                    cv2.rectangle(display_frame, (x, y), (x+w, y+h), (0, 0, 255), 2)
-                    cv2.putText(display_frame, message, (x, y-10), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-                
-                if count >= self.required_images:
-                    break
+                    self.current_angle_index += 1
+                    if self.current_angle_index < len(self.angles):
+                        self.waiting_for_enter = True
+                    else:
+                        break
             
-            # Display guide text
-            cv2.putText(display_frame, "Position face within square", (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(display_frame, f"Captured: {count}/{self.required_images}", (10, 60), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.imshow('Face Capture', frame)
             
-            cv2.imshow('Face Capture - Align face within square', display_frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            # Handle key presses
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 break
+            elif key == ord('s') and not self.capturing:
+                self.capturing = True
+            elif key == 13 and self.waiting_for_enter:  # Enter key
+                self.waiting_for_enter = False
         
-        pbar.close()
         cap.release()
         cv2.destroyAllWindows()
-        return count
+        
+        # Print summary
+        print("\nCapture Summary:")
+        for angle in self.angles:
+            print(f"{angle['name']}: {angle['count']}/{self.images_per_angle} images")
+        
+        total_images = sum(angle['count'] for angle in self.angles)
+        print(f"\nTotal images captured: {total_images}")
+        return total_images
 
     def verify_dataset(self):
-        """Verify the captured images"""
-        image_files = os.listdir(self.image_dir)
-        print(f"Total images captured: {len(image_files)}")
-        return len(image_files)
+        """Verify captured images"""
+        print("\nVerifying captured images...")
+        total_verified = 0
+        
+        for student_folder in os.listdir('dataset'):
+            if student_folder.startswith('student_'):
+                folder_path = os.path.join('dataset', student_folder)
+                image_files = [f for f in os.listdir(folder_path) 
+                             if f.endswith(('.jpg', '.jpeg', '.png'))]
+                total_verified += len(image_files)
+                print(f"{student_folder}: {len(image_files)} images")
+        
+        print(f"\nTotal verified images: {total_verified}")
+        return total_verified
 
 if __name__ == "__main__":
-    face_capture = FaceCapture()
     student_id = input("Enter student ID: ")
+    print("\nFace Capture Instructions:")
+    print("1. Press 'S' to start the capture process")
+    print("2. Follow on-screen instructions")
+    print("3. Press ENTER to start capturing each angle")
+    print("4. Press 'Q' to quit at any time\n")
     
-    print("\nStarting face capture system...")
-    print("\nGuidelines:")
-    print("1. Position your face within the green square")
-    print("2. Maintain good lighting")
-    print("3. Move slowly to capture different angles")
-    print("4. Keep eyes open and maintain neutral expression")
-    print("5. Press 'q' to quit\n")
-    
-    captured = face_capture.capture_faces(student_id)
-    
-    if captured == 250:
-        print("\nSuccessfully captured all required images!")
-    else:
-        print(f"\nCaptured {captured} images out of 250")
-    
+    face_capture = FaceCapture()
+    total_captured = face_capture.capture_faces(student_id)
     face_capture.verify_dataset() 

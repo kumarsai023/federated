@@ -1,126 +1,155 @@
 import cv2
-import face_recognition
+import torch
 import numpy as np
 from PIL import Image
 import os
+from face_recognition_model import FaceRecognitionModel
+from torchvision import transforms
 
 class RealtimeFaceRecognition:
     def __init__(self):
         print("Initializing Face Recognition System...")
         
-        # Load the known face image and encode it
-        self.known_face_encodings = []
-        self.known_face_names = []
+        # Set up device
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {self.device}")
         
-        # Load images from dataset
-        dataset_path = "dataset/student_1"
-        print("Loading known faces from dataset...")
-        
-        # Take first 5 images for encoding (for speed)
-        image_files = os.listdir(dataset_path)[:5]
-        
-        for image_file in image_files:
-            image_path = os.path.join(dataset_path, image_file)
-            image = face_recognition.load_image_file(image_path)
+        # Load the trained model
+        try:
+            self.model = FaceRecognitionModel().to(self.device)
+            model_path = 'best_model.pth'
             
-            # Get face encodings from the image
-            face_encodings = face_recognition.face_encodings(image)
-            
-            if len(face_encodings) > 0:
-                self.known_face_encodings.append(face_encodings[0])
-                self.known_face_names.append("Student 1")
+            if os.path.exists(model_path):
+                print(f"\nFound model file: {model_path}")
+                self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+                print("Model loaded successfully!")
+            else:
+                raise Exception(f"Model file not found: {model_path}")
                 
-        print(f"Loaded {len(self.known_face_encodings)} face encodings")
+            self.model.eval()
+            
+        except Exception as e:
+            print(f"\nError loading model: {e}")
+            raise
+
+        # Load dataset for student recognition
+        self.student_data = {}
+        dataset_path = "dataset"
+        if os.path.exists(dataset_path):
+            for student_folder in os.listdir(dataset_path):
+                if student_folder.startswith('student_'):
+                    student_id = student_folder.split('_')[1]
+                    self.student_data[student_id] = student_folder
+            print(f"\nFound {len(self.student_data)} students in dataset")
+            print("Student IDs:", list(self.student_data.keys()))
+
+        # Initialize face detection
+        self.face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        )
         
-        # Initialize variables
-        self.face_locations = []
-        self.face_encodings = []
-        self.face_names = []
-        self.process_this_frame = True
+        # Image preprocessing
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                              std=[0.229, 0.224, 0.225])
+        ])
         
         # Set confidence threshold
         self.confidence_threshold = 0.5
-        print(f"Initial confidence threshold: {self.confidence_threshold}")
-
-    def run_detection(self):
-        print("Starting real-time detection...")
-        print("Controls:")
+        self.process_this_frame = True
+        self.face_names = []
+        
+        print("\nSystem initialization complete!")
+        print("\nControls:")
         print("- Press '+' to increase confidence threshold")
         print("- Press '-' to decrease confidence threshold")
         print("- Press 'q' to quit")
+        print("- Press 's' to save frame")
+
+    def process_face(self, face_img):
+        """Process face image and get prediction"""
+        try:
+            # Convert BGR to RGB
+            rgb_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
+            
+            # Convert to PIL Image
+            pil_img = Image.fromarray(rgb_img)
+            
+            # Transform image
+            img_tensor = self.transform(pil_img).unsqueeze(0).to(self.device)
+            
+            # Get prediction
+            with torch.no_grad():
+                output = self.model(img_tensor)
+                probability = torch.sigmoid(output).item()
+            return probability
+            
+        except Exception as e:
+            print(f"Error processing face: {e}")
+            return 0.0
+
+    def run_detection(self):
+        print("Starting real-time detection...")
         
-        # Get a reference to webcam
         video_capture = cv2.VideoCapture(0)
+        frame_count = 0
 
         while True:
-            # Grab a single frame of video
             ret, frame = video_capture.read()
             if not ret:
                 print("Failed to grab frame")
                 break
 
-            # Only process every other frame of video to save time
             if self.process_this_frame:
-                # Resize frame for faster face recognition
-                small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
-
-                # Convert the image from BGR color to RGB color
-                rgb_small_frame = small_frame[:, :, ::-1]
-
-                # Find all the faces and face encodings in the current frame
-                self.face_locations = face_recognition.face_locations(rgb_small_frame)
-                self.face_encodings = face_recognition.face_encodings(rgb_small_frame, self.face_locations)
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                faces = self.face_cascade.detectMultiScale(
+                    gray,
+                    scaleFactor=1.1,
+                    minNeighbors=5,
+                    minSize=(30, 30)
+                )
 
                 self.face_names = []
-                for face_encoding in self.face_encodings:
-                    # See if the face is a match for the known faces
-                    matches = face_recognition.compare_faces(
-                        self.known_face_encodings, 
-                        face_encoding,
-                        tolerance=self.confidence_threshold
-                    )
-                    name = "Unknown"
-
-                    if True in matches:
-                        # Calculate face distance (lower is better)
-                        face_distances = face_recognition.face_distance(self.known_face_encodings, face_encoding)
-                        best_match_index = np.argmin(face_distances)
-                        confidence = 1 - face_distances[best_match_index]
+                for (x, y, w, h) in faces:
+                    try:
+                        # Extract face ROI
+                        face_img = frame[y:y+h, x:x+w]
                         
-                        if matches[best_match_index] and confidence > self.confidence_threshold:
-                            name = f"{self.known_face_names[best_match_index]} ({confidence:.2f})"
-
-                    self.face_names.append(name)
+                        # Get probability
+                        probability = self.process_face(face_img)
+                        
+                        # Determine if recognized
+                        is_recognized = probability > self.confidence_threshold
+                        if is_recognized:
+                            name = f"Student 1 ({probability:.2f})"  # For first client
+                        else:
+                            name = f"Unknown ({probability:.2f})"
+                        
+                        self.face_names.append((name, (x, y, w, h)))
+                    except Exception as e:
+                        print(f"Error processing face: {e}")
+                        continue
 
             self.process_this_frame = not self.process_this_frame
 
             # Display the results
-            for (top, right, bottom, left), name in zip(self.face_locations, self.face_names):
-                # Scale back up face locations
-                top *= 4
-                right *= 4
-                bottom *= 4
-                left *= 4
-
-                # Draw box and label
-                if "Unknown" in name:
-                    color = (0, 0, 255)  # Red for unknown
-                else:
-                    color = (0, 255, 0)  # Green for recognized
-
-                # Draw a box around the face
-                cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-
-                # Draw a label with a name below the face
-                cv2.rectangle(frame, (left, bottom - 35), (right, bottom), color, cv2.FILLED)
-                cv2.putText(frame, name, (left + 6, bottom - 6),
+            for name, (x, y, w, h) in self.face_names:
+                color = (0, 255, 0) if "Student" in name else (0, 0, 255)
+                
+                # Draw box
+                cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+                
+                # Draw label
+                label_y = y - 10 if y - 10 > 10 else y + h + 10
+                cv2.putText(frame, name, (x, label_y),
                            cv2.FONT_HERSHEY_DUPLEX, 0.6, (255, 255, 255), 1)
 
             # Display threshold
             cv2.putText(frame, f"Threshold: {self.confidence_threshold:.2f}",
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-            # Display the resulting image
             cv2.imshow('Face Recognition', frame)
 
             # Handle key presses
@@ -133,11 +162,17 @@ class RealtimeFaceRecognition:
             elif key == ord('-'):
                 self.confidence_threshold = max(0.0, self.confidence_threshold - 0.05)
                 print(f"Threshold decreased to: {self.confidence_threshold:.2f}")
+            elif key == ord('s'):
+                frame_count += 1
+                cv2.imwrite(f'test_frame_{frame_count}.jpg', frame)
+                print(f"Saved frame {frame_count}")
 
-        # Release handle to the webcam
         video_capture.release()
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    face_recognizer = RealtimeFaceRecognition()
-    face_recognizer.run_detection() 
+    try:
+        face_recognizer = RealtimeFaceRecognition()
+        face_recognizer.run_detection()
+    except Exception as e:
+        print(f"Error: {str(e)}") 
